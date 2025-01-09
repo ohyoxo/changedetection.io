@@ -1,5 +1,5 @@
 import os
-from distutils.util import strtobool
+from changedetectionio.strtobool import strtobool
 
 from flask_expects_json import expects_json
 from changedetectionio import queuedWatchMetaData
@@ -12,9 +12,10 @@ import copy
 # See docs/README.md for rebuilding the docs/apidoc information
 
 from . import api_schema
+from ..model import watch_base
 
 # Build a JSON Schema atleast partially based on our Watch model
-from changedetectionio.model.Watch import base_config as watch_base_config
+watch_base_config = watch_base()
 schema = api_schema.build_watch_json_schema(watch_base_config)
 
 schema_create_watch = copy.deepcopy(schema)
@@ -57,7 +58,7 @@ class Watch(Resource):
             abort(404, message='No watch exists with the UUID of {}'.format(uuid))
 
         if request.args.get('recheck'):
-            self.update_q.put(queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid, 'skip_when_checksum_same': True}))
+            self.update_q.put(queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid}))
             return "OK", 200
         if request.args.get('paused', '') == 'paused':
             self.datastore.data['watching'].get(uuid).pause()
@@ -75,6 +76,7 @@ class Watch(Resource):
         # Return without history, get that via another API call
         # Properties are not returned as a JSON, so add the required props manually
         watch['history_n'] = watch.history_n
+        # attr .last_changed will check for the last written text snapshot on change
         watch['last_changed'] = watch.last_changed
         watch['viewed'] = watch.viewed
         return watch
@@ -133,6 +135,7 @@ class WatchHistory(Resource):
 
     # Get a list of available history for a watch by UUID
     # curl http://localhost:5000/api/v1/watch/<string:uuid>/history
+    @auth.check_token
     def get(self, uuid):
         """
         @api {get} /api/v1/watch/<string:uuid>/history Get a list of all historical snapshots available for a watch
@@ -169,23 +172,33 @@ class WatchSingleHistory(Resource):
             curl http://localhost:5000/api/v1/watch/cc0cfffa-f449-477b-83ea-0caafd1dc091/history/1677092977 -H"x-api-key:813031b16330fe25e3780cf0325daa45" -H "Content-Type: application/json"
         @apiName Get single snapshot content
         @apiGroup Watch History
+        @apiParam {String} [html]       Optional Set to =1 to return the last HTML (only stores last 2 snapshots, use `latest` as timestamp)
         @apiSuccess (200) {String} OK
         @apiSuccess (404) {String} ERR Not found
         """
         watch = self.datastore.data['watching'].get(uuid)
         if not watch:
-            abort(404, message='No watch exists with the UUID of {}'.format(uuid))
+            abort(404, message=f"No watch exists with the UUID of {uuid}")
 
         if not len(watch.history):
-            abort(404, message='Watch found but no history exists for the UUID {}'.format(uuid))
+            abort(404, message=f"Watch found but no history exists for the UUID {uuid}")
 
         if timestamp == 'latest':
             timestamp = list(watch.history.keys())[-1]
 
-        content = watch.get_history_snapshot(timestamp)
+        if request.args.get('html'):
+            content = watch.get_fetched_html(timestamp)
+            if content:
+                response = make_response(content, 200)
+                response.mimetype = "text/html"
+            else:
+                response = make_response("No content found", 404)
+                response.mimetype = "text/plain"
+        else:
+            content = watch.get_history_snapshot(timestamp)
+            response = make_response(content, 200)
+            response.mimetype = "text/plain"
 
-        response = make_response(content, 200)
-        response.mimetype = "text/plain"
         return response
 
 
@@ -234,7 +247,7 @@ class CreateWatch(Resource):
 
         new_uuid = self.datastore.add_watch(url=url, extras=extras, tag=tags)
         if new_uuid:
-            self.update_q.put(queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': new_uuid, 'skip_when_checksum_same': True}))
+            self.update_q.put(queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': new_uuid}))
             return {'uuid': new_uuid}, 201
         else:
             return "Invalid or unsupported URL", 400
@@ -291,7 +304,7 @@ class CreateWatch(Resource):
 
         if request.args.get('recheck_all'):
             for uuid in self.datastore.data['watching'].keys():
-                self.update_q.put(queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid, 'skip_when_checksum_same': True}))
+                self.update_q.put(queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid}))
             return {'status': "OK"}, 200
 
         return list, 200
